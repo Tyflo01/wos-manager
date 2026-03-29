@@ -1,0 +1,12 @@
+{
+  "name": "wos-manager",
+  "version": "1.0.0",
+  "main": "Bot.js",
+  "scripts": {
+    "start": "node Bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.21.0",
+    "dotenv": "^17.2.3"
+  }
+}
