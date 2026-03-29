@@ -100,13 +100,26 @@ function buildDraftButtons(draftId) {
   ];
 }
 
+function truncateText(text, maxLength) {
+  if (!text || text.length <= maxLength) {
+    return text || '';
+  }
+
+  return text.slice(0, maxLength - 3).trimEnd() + '...';
+}
+
 function buildDraftPreview(draft) {
-  return (
+  const header =
     `🧠 **Brouillon IA - ${draft.eventLabel}**\n` +
     `📍 Salon cible : <#${draft.targetChannelId}>\n` +
-    `👤 Demandé par : <@${draft.requestedBy}>\n\n` +
-    `${draft.content}`
-  );
+    `👤 Demandé par : <@${draft.requestedBy}>\n\n`;
+
+  const footer = `\n\n⚠️ Aperçu tronqué si le brouillon est trop long.`;
+  const maxContentLength = 2000 - header.length - footer.length;
+
+  const previewText = truncateText(draft.content, Math.max(200, maxContentLength));
+
+  return header + previewText + footer;
 }
 
 async function sendLog(guild, text) {
@@ -166,7 +179,36 @@ async function publishDraft(guild, draft) {
     throw new Error('Salon cible introuvable ou non textuel.');
   }
 
-  await targetChannel.send(draft.content);
+  const parts = splitMessage(draft.content, 2000);
+
+  for (const part of parts) {
+    await targetChannel.send(part);
+  }
+}
+  function splitMessage(text, maxLength = 2000) {
+  const chunks = [];
+  let remaining = text.trim();
+
+  while (remaining.length > maxLength) {
+    let splitIndex = remaining.lastIndexOf('\n', maxLength);
+
+    if (splitIndex < 100) {
+      splitIndex = remaining.lastIndexOf(' ', maxLength);
+    }
+
+    if (splitIndex < 100) {
+      splitIndex = maxLength;
+    }
+
+    chunks.push(remaining.slice(0, splitIndex).trim());
+    remaining = remaining.slice(splitIndex).trim();
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
 }
 
 client.once(Events.ClientReady, () => {
