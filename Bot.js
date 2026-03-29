@@ -102,19 +102,33 @@ client.on(Events.GuildMemberAdd, async (member) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
-  try {
-    if (message.author.bot) return;
-    if (!message.guild) return;
-    if (message.content !== '!test') return;
+  if (message.author.bot) return;
+  if (!message.guild) return;
+
+  // COMMANDE ADMIN
+  if (message.content === '!setup-lang') {
+
+    // sécurité : admin uniquement
+    if (!message.member.permissions.has('Administrator')) {
+      return message.reply("❌ Tu n'as pas la permission.");
+    }
 
     await message.channel.send({
       content:
-        `🧪 **Test du panneau de langue**\n` +
-        `Clique sur un bouton pour tester l’attribution du rôle.`,
+        `🌍 **Choisis ta langue :**\n` +
+        `Clique sur un bouton ci-dessous :`,
       components: buildLanguageButtons(),
     });
-  } catch (error) {
-    console.error('Erreur commande !test :', error);
+
+    return;
+  }
+
+  // TEST
+  if (message.content === '!test') {
+    await message.channel.send({
+      content: "🧪 Test du panneau de langue",
+      components: buildLanguageButtons(),
+    });
   }
 });
 
