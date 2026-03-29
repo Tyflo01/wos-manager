@@ -272,23 +272,54 @@ ${extraInstructions || 'Aucune.'}
 }
 
 async function publishDraft(guild, draft, options = {}) {
-  const targetChannel = await guild.channels.fetch(draft.targetChannelId).catch(() => null);
+  const targetChannel = await guild.channels.fetch(draft.targetChannelId).catch((err) => {
+    console.error('Erreur fetch salon cible :', err);
+    return null;
+  });
 
   if (!targetChannel || !targetChannel.isTextBased()) {
     throw new Error('Salon cible introuvable ou non textuel.');
   }
 
+  const botMember = await guild.members.fetchMe().catch((err) => {
+    console.error('Erreur fetch bot member :', err);
+    return null;
+  });
+
+  if (!botMember) {
+    throw new Error('Impossible de récupérer le bot dans le serveur.');
+  }
+
+  const permissions = targetChannel.permissionsFor(botMember);
+
+  if (!permissions?.has(PermissionFlagsBits.ViewChannel)) {
+    throw new Error(`Le bot ne peut pas voir le salon cible.`);
+  }
+
+  if (!permissions?.has(PermissionFlagsBits.SendMessages)) {
+    throw new Error(`Le bot ne peut pas envoyer de messages dans le salon cible.`);
+  }
+
+  if (!permissions?.has(PermissionFlagsBits.EmbedLinks)) {
+    throw new Error(`Le bot ne peut pas envoyer d'embed dans le salon cible.`);
+  }
+
   const embeds = buildGuideEmbeds(draft);
 
   for (let i = 0; i < embeds.length; i++) {
-    const payload = { embeds: [embeds[i]] };
+    const payload = {
+      embeds: [embeds[i]],
+    };
 
     if (i === 0 && options.mentionEveryone) {
       payload.content = '@everyone';
       payload.allowedMentions = { parse: ['everyone'] };
     }
 
-    await targetChannel.send(payload);
+    await targetChannel.send(payload).catch((err) => {
+      console.error(`Erreur envoi embed partie ${i + 1} :`, err);
+      throw err;
+    });
   }
 }
 
@@ -586,49 +617,72 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       if (action === 'validate' || action === 'validate_everyone') {
-        await publishDraft(interaction.guild, draft, {
-          mentionEveryone: action === 'validate_everyone',
-        });
+  await interaction.deferUpdate();
 
-        await interaction.update({
-          content:
-            `✅ **Publié** dans <#${draft.targetChannelId}>` +
-            (action === 'validate_everyone' ? ' avec **@everyone**.' : '.'),
-          components: [],
-        });
+  try {
+    await publishDraft(interaction.guild, draft, {
+      mentionEveryone: action === 'validate_everyone',
+    });
 
-        await sendLog(
-          interaction.guild,
-          `✅ Guide **${draft.eventLabel}** publié par **${interaction.user.tag}**` +
-            (action === 'validate_everyone' ? ' avec @everyone' : '')
-        );
+    await interaction.message.edit({
+      content:
+        `✅ **Publié** dans <#${draft.targetChannelId}>` +
+        (action === 'validate_everyone' ? ' avec **@everyone**.' : '.'),
+      components: [],
+    });
 
-        draftStore.delete(draftId);
-        return;
-      }
+    await sendLog(
+      interaction.guild,
+      `✅ Guide **${draft.eventLabel}** publié par **${interaction.user.tag}**` +
+        (action === 'validate_everyone' ? ' avec @everyone' : '')
+    );
+
+    draftStore.delete(draftId);
+  } catch (publishError) {
+    console.error('Erreur publication draft :', publishError);
+
+    await interaction.message.edit({
+      content:
+        `❌ **Échec de publication** pour **${draft.eventLabel}** dans <#${draft.targetChannelId}>.\n` +
+        `Le brouillon a été conservé pour nouvel essai.`,
+      components: buildDraftButtons(draftId),
+    }).catch(() => {});
+  }
+
+  return;
+}
 
       if (action === 'refuse') {
-        await interaction.update({
-          content: `⏳ Régénération du brouillon **${draft.eventLabel}**...`,
-          components: [],
-        });
+  await interaction.deferUpdate();
 
-        const regenerated = await generateEventGuide(
-          draft.eventKey,
-          'Propose une nouvelle version, plus claire, plus structurée, plus utile et plus naturelle que la précédente.'
-        );
+  try {
+    const regenerated = await generateEventGuide(
+      draft.eventKey,
+      'Propose une nouvelle version, plus claire, plus structurée, plus utile et plus naturelle que la précédente.'
+    );
 
-        draft.content = regenerated;
-        draftStore.set(draftId, draft);
+    draft.content = regenerated;
+    draftStore.set(draftId, draft);
 
-        await updateStoredDraftMessage(interaction.guild, draftId);
+    await updateStoredDraftMessage(interaction.guild, draftId);
 
-        await sendLog(
-          interaction.guild,
-          `🔁 Brouillon **${draft.eventLabel}** régénéré par **${interaction.user.tag}**`
-        );
-        return;
-      }
+    await sendLog(
+      interaction.guild,
+      `🔁 Brouillon **${draft.eventLabel}** régénéré par **${interaction.user.tag}**`
+    );
+  } catch (regenError) {
+    console.error('Erreur régénération draft :', regenError);
+
+    await interaction.message.edit({
+      content:
+        `❌ **Échec de régénération** pour **${draft.eventLabel}**.\n` +
+        `Le brouillon actuel a été conservé.`,
+      components: buildDraftButtons(draftId),
+    }).catch(() => {});
+  }
+
+  return;
+}
 
       if (action === 'edit') {
         const modal = new ModalBuilder()
