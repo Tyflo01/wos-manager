@@ -1,5 +1,8 @@
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
+
 const {
   Client,
   GatewayIntentBits,
@@ -13,9 +16,16 @@ const {
   PermissionFlagsBits,
   EmbedBuilder,
   StringSelectMenuBuilder,
+  MessageFlags,
 } = require('discord.js');
 
 const OpenAI = require('openai');
+
+//
+// ============================================================
+// 1) INITIALISATION DU BOT ET DU CLIENT OPENAI
+// ============================================================
+//
 
 const client = new Client({
   intents: [
@@ -30,10 +40,24 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+//
+// ============================================================
+// 2) VARIABLES D'ENVIRONNEMENT
+//    -> à configurer dans ton fichier .env
+// ============================================================
+//
+
 const WELCOME_CHANNEL_ID = process.env.WELCOME_CHANNEL_ID;
 const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 const AUTO_ROLE_ID = process.env.AUTO_ROLE_ID;
 const DRAFT_CHANNEL_ID = process.env.DRAFT_CHANNEL_ID;
+
+//
+// ============================================================
+// 3) ROLES DE LANGUE
+//    -> chaque langue pointe vers un ROLE ID Discord
+// ============================================================
+//
 
 const ROLES = {
   fr: process.env.ROLE_FR,
@@ -43,6 +67,14 @@ const ROLES = {
   ru: process.env.ROLE_RU || '',
 };
 
+//
+// ============================================================
+// 4) EVENEMENTS DISPONIBLES
+//    -> clé interne = nom utilisé par le bot
+//    -> valeur = ID du salon Discord cible
+// ============================================================
+//
+
 const EVENT_CHANNELS = {
   beartrap: process.env.CHANNEL_BEAR_TRAP_ID,
   crazyjoe: process.env.CHANNEL_CRAZY_JOE_ID,
@@ -50,6 +82,9 @@ const EVENT_CHANNELS = {
   foundry: process.env.CHANNEL_FOUNDRY_ID,
 };
 
+//
+// Labels lisibles pour l'utilisateur
+//
 const EVENT_LABELS = {
   beartrap: 'Bear Trap',
   crazyjoe: 'Crazy Joe',
@@ -57,6 +92,9 @@ const EVENT_LABELS = {
   foundry: 'Bataille de la Fonderie',
 };
 
+//
+// Couleurs des embeds publiés
+//
 const EVENT_COLORS = {
   beartrap: 0xf59e0b,
   crazyjoe: 0xef4444,
@@ -64,8 +102,29 @@ const EVENT_COLORS = {
   foundry: 0x8b5cf6,
 };
 
+//
+// ============================================================
+// 5) STOCKAGE EN MEMOIRE
+// ============================================================
+//
+
+// Stocke les brouillons générés en attente de validation
 const draftStore = new Map();
+
+// Stocke les conversations de rédaction en cours
 const conversationStore = new Map();
+
+//
+// Fichier JSON pour persister les drafts entre redémarrages
+//
+const DRAFTS_FILE = path.join(__dirname, 'drafts.json');
+
+//
+// ============================================================
+// 6) QUESTIONS DE LA CONVERSATION GUIDE
+//    -> le bot pose ces questions avant de générer le guide
+// ============================================================
+//
 
 const CONVERSATION_QUESTIONS = [
   "Quel est l'objectif du message ?",
@@ -76,78 +135,61 @@ const CONVERSATION_QUESTIONS = [
   "Y a-t-il un format particulier souhaité ?",
 ];
 
-function buildLanguageButtons() {
-  const buttons = [
-    { id: 'lang_fr', label: 'Français', style: ButtonStyle.Primary },
-    { id: 'lang_en', label: 'English', style: ButtonStyle.Primary },
-    { id: 'lang_de', label: 'Deutsch', style: ButtonStyle.Primary },
-    { id: 'lang_it', label: 'Italiano', style: ButtonStyle.Primary },
-  ];
+//
+// ============================================================
+// 7) FONCTIONS DE SAUVEGARDE / CHARGEMENT DES DRAFTS
+// ============================================================
+//
 
-
-  if (ROLES.ru) {
-    buttons.push({ id: 'lang_ru', label: 'Русский', style: ButtonStyle.Primary });
+function saveDraftStore() {
+  try {
+    const data = Object.fromEntries(draftStore);
+    fs.writeFileSync(DRAFTS_FILE, JSON.stringify(data, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Erreur sauvegarde drafts :', error);
   }
-
-  const row = new ActionRowBuilder().addComponents(
-    buttons.map((button) =>
-      new ButtonBuilder()
-        .setCustomId(button.id)
-        .setLabel(button.label)
-        .setStyle(button.style)
-    )
-  );
-
-  return [row];
 }
 
-function buildEventSelectMenu() {
-  const options = Object.entries(EVENT_LABELS).map(([value, label]) => ({
-    label,
-    value,
-    description: `Créer un brouillon pour ${label}`,
-  }));
+function loadDraftStore() {
+  try {
+    if (!fs.existsSync(DRAFTS_FILE)) return;
 
-  const select = new StringSelectMenuBuilder()
-    .setCustomId('draft_event_select')
-    .setPlaceholder('Choisis un événement à rédiger')
-    .addOptions(options);
+    const raw = fs.readFileSync(DRAFTS_FILE, 'utf8');
+    if (!raw.trim()) return;
 
-  return [
-    new ActionRowBuilder().addComponents(select),
-  ];
+    const parsed = JSON.parse(raw);
+
+    for (const [key, value] of Object.entries(parsed)) {
+      draftStore.set(key, value);
+    }
+
+    console.log(`✅ ${draftStore.size} brouillon(s) rechargé(s) depuis drafts.json`);
+  } catch (error) {
+    console.error('Erreur chargement drafts :', error);
+  }
 }
 
-function buildDraftButtons(draftId) {
-  return [
-    new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(`draft_validate:${draftId}`)
-        .setLabel('Valider')
-        .setStyle(ButtonStyle.Success),
-      new ButtonBuilder()
-        .setCustomId(`draft_validate_everyone:${draftId}`)
-        .setLabel('Valider + @everyone')
-        .setStyle(ButtonStyle.Primary),
-      new ButtonBuilder()
-        .setCustomId(`draft_refuse:${draftId}`)
-        .setLabel('Refuser')
-        .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`draft_edit:${draftId}`)
-        .setLabel('Éditer')
-        .setStyle(ButtonStyle.Secondary)
-    ),
-  ];
+//
+// ============================================================
+// 8) OUTILS / HELPERS
+// ============================================================
+//
+
+// Génère une clé unique par serveur + utilisateur
+function getSessionKey(guildId, userId) {
+  return `${guildId}:${userId}`;
 }
 
+// Tronque un texte trop long
 function truncateText(text, maxLength) {
   if (!text || text.length <= maxLength) {
     return text || '';
   }
+
   return text.slice(0, maxLength - 3).trimEnd() + '...';
 }
 
+// Coupe un texte en morceaux pour Discord / embeds
 function splitMessage(text, maxLength = 4000) {
   const chunks = [];
   let remaining = (text || '').trim();
@@ -174,9 +216,150 @@ function splitMessage(text, maxLength = 4000) {
   return chunks;
 }
 
-function getSessionKey(guildId, userId) {
-  return `${guildId}:${userId}`;
+//
+// ============================================================
+// 9) CONSTRUCTION DES COMPOSANTS DISCORD
+// ============================================================
+//
+
+// Boutons de sélection de langue
+function buildLanguageButtons() {
+  const buttons = [
+    { id: 'lang_fr', label: 'Français', style: ButtonStyle.Primary },
+    { id: 'lang_en', label: 'English', style: ButtonStyle.Primary },
+    { id: 'lang_de', label: 'Deutsch', style: ButtonStyle.Primary },
+    { id: 'lang_it', label: 'Italiano', style: ButtonStyle.Primary },
+  ];
+
+  if (ROLES.ru) {
+    buttons.push({ id: 'lang_ru', label: 'Русский', style: ButtonStyle.Primary });
+  }
+
+  const row = new ActionRowBuilder().addComponents(
+    buttons.map((button) =>
+      new ButtonBuilder()
+        .setCustomId(button.id)
+        .setLabel(button.label)
+        .setStyle(button.style)
+    )
+  );
+
+  return [row];
 }
+
+// Boutons de gestion d'un brouillon
+function buildDraftButtons(draftId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`draft_validate:${draftId}`)
+        .setLabel('Valider')
+        .setStyle(ButtonStyle.Success),
+
+      new ButtonBuilder()
+        .setCustomId(`draft_validate_everyone:${draftId}`)
+        .setLabel('Valider + @everyone')
+        .setStyle(ButtonStyle.Primary),
+
+      new ButtonBuilder()
+        .setCustomId(`draft_refuse:${draftId}`)
+        .setLabel('Refuser')
+        .setStyle(ButtonStyle.Danger),
+
+      new ButtonBuilder()
+        .setCustomId(`draft_edit:${draftId}`)
+        .setLabel('Éditer')
+        .setStyle(ButtonStyle.Secondary)
+    ),
+  ];
+}
+
+// Menu déroulant pour choisir l'événement
+function buildEventSelectMenu() {
+  const options = Object.entries(EVENT_LABELS).map(([value, label]) => ({
+    label,
+    value,
+    description: `Créer un brouillon pour ${label}`,
+  }));
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('draft_event_select')
+    .setPlaceholder('Choisis un événement à rédiger')
+    .addOptions(options);
+
+  return [new ActionRowBuilder().addComponents(select)];
+}
+
+//
+// ============================================================
+// 10) CONSTRUCTION DES APERCUS ET EMBEDS
+// ============================================================
+//
+
+// Aperçu texte d'un draft dans le salon de drafts
+function buildDraftPreview(draft) {
+  const header =
+    `🧠 **Brouillon IA - ${draft.eventLabel}**\n` +
+    `🆔 Draft ID : \`${draft.id}\`\n` +
+    `📍 Salon cible : <#${draft.targetChannelId}>\n` +
+    `👤 Demandé par : <@${draft.requestedBy}>\n\n`;
+
+  const footer = `\n\n⚠️ Aperçu tronqué si le brouillon est trop long.`;
+  const maxContentLength = 2000 - header.length - footer.length;
+
+  const previewText = truncateText(draft.content, Math.max(200, maxContentLength));
+
+  return header + previewText + footer;
+}
+
+// Découpe le guide final en embeds publiables
+function buildGuideEmbeds(draft) {
+  const parts = splitMessage(draft.content, 4000);
+
+  return parts.map((part, index) => {
+    const embed = new EmbedBuilder()
+      .setColor(EVENT_COLORS[draft.eventKey] || 0x2b2d31)
+      .setDescription(part)
+      .setFooter({
+        text:
+          parts.length > 1
+            ? `${draft.eventLabel} • Partie ${index + 1}/${parts.length}`
+            : `${draft.eventLabel}`,
+      })
+      .setTimestamp();
+
+    if (index === 0) {
+      embed.setTitle(`📘 ${draft.eventLabel}`);
+    }
+
+    return embed;
+  });
+}
+
+//
+// ============================================================
+// 11) LOGS DANS UN SALON DISCORD
+// ============================================================
+//
+
+async function sendLog(guild, text) {
+  try {
+    if (!LOG_CHANNEL_ID) return;
+
+    const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
+    if (!logChannel || !logChannel.isTextBased()) return;
+
+    await logChannel.send(text);
+  } catch (error) {
+    console.error('Erreur envoi log :', error);
+  }
+}
+
+//
+// ============================================================
+// 12) CONSTRUCTION DES INSTRUCTIONS POUR L'IA
+// ============================================================
+//
 
 function buildConversationInstructions(session) {
   const lines = [];
@@ -203,54 +386,11 @@ Respecte strictement les demandes ci-dessus.
 `;
 }
 
-function buildDraftPreview(draft) {
-  const header =
-    `🧠 **Brouillon IA - ${draft.eventLabel}**\n` +
-    `📍 Salon cible : <#${draft.targetChannelId}>\n` +
-    `👤 Demandé par : <@${draft.requestedBy}>\n\n`;
-
-  const footer = `\n\n⚠️ Aperçu tronqué si le brouillon est trop long.`;
-  const maxContentLength = 2000 - header.length - footer.length;
-
-  const previewText = truncateText(draft.content, Math.max(200, maxContentLength));
-  return header + previewText + footer;
-}
-
-function buildGuideEmbeds(draft) {
-  const parts = splitMessage(draft.content, 4000);
-
-  return parts.map((part, index) => {
-    const embed = new EmbedBuilder()
-      .setColor(EVENT_COLORS[draft.eventKey] || 0x2b2d31)
-      .setDescription(part)
-      .setFooter({
-        text:
-          parts.length > 1
-            ? `${draft.eventLabel} • Partie ${index + 1}/${parts.length}`
-            : `${draft.eventLabel}`,
-      })
-      .setTimestamp();
-
-    if (index === 0) {
-      embed.setTitle(`📘 ${draft.eventLabel}`);
-    }
-
-    return embed;
-  });
-}
-
-async function sendLog(guild, text) {
-  try {
-    if (!LOG_CHANNEL_ID) return;
-
-    const logChannel = await guild.channels.fetch(LOG_CHANNEL_ID).catch(() => null);
-    if (!logChannel || !logChannel.isTextBased()) return;
-
-    await logChannel.send(text);
-  } catch (error) {
-    console.error('Erreur envoi log :', error);
-  }
-}
+//
+// ============================================================
+// 13) APPEL OPENAI POUR GENERER LE GUIDE
+// ============================================================
+//
 
 async function generateEventGuide(eventKey, extraInstructions = '') {
   const eventLabel = EVENT_LABELS[eventKey] || eventKey;
@@ -283,12 +423,19 @@ ${extraInstructions || 'Aucune.'}
   });
 
   const text = response.output_text?.trim();
+
   if (!text) {
     throw new Error('Réponse IA vide.');
   }
 
   return text;
 }
+
+//
+// ============================================================
+// 14) PUBLICATION D'UN BROUILLON
+// ============================================================
+//
 
 async function publishDraft(guild, draft, options = {}) {
   const targetChannel = await guild.channels.fetch(draft.targetChannelId).catch((err) => {
@@ -310,17 +457,26 @@ async function publishDraft(guild, draft, options = {}) {
   }
 
   const permissions = targetChannel.permissionsFor(botMember);
+  const missingPerms = [];
 
   if (!permissions?.has(PermissionFlagsBits.ViewChannel)) {
-    throw new Error(`Le bot ne peut pas voir le salon cible.`);
+    missingPerms.push('ViewChannel');
   }
 
   if (!permissions?.has(PermissionFlagsBits.SendMessages)) {
-    throw new Error(`Le bot ne peut pas envoyer de messages dans le salon cible.`);
+    missingPerms.push('SendMessages');
   }
 
   if (!permissions?.has(PermissionFlagsBits.EmbedLinks)) {
-    throw new Error(`Le bot ne peut pas envoyer d'embed dans le salon cible.`);
+    missingPerms.push('EmbedLinks');
+  }
+
+  if (options.mentionEveryone && !permissions?.has(PermissionFlagsBits.MentionEveryone)) {
+    missingPerms.push('MentionEveryone');
+  }
+
+  if (missingPerms.length > 0) {
+    throw new Error(`Permissions manquantes dans le salon cible : ${missingPerms.join(', ')}`);
   }
 
   const embeds = buildGuideEmbeds(draft);
@@ -342,6 +498,12 @@ async function publishDraft(guild, draft, options = {}) {
   }
 }
 
+//
+// ============================================================
+// 15) MISE A JOUR D'UN MESSAGE DE DRAFT DEJA POSTE
+// ============================================================
+//
+
 async function updateStoredDraftMessage(guild, draftId) {
   const draft = draftStore.get(draftId);
   if (!draft || !draft.draftChannelId || !draft.draftMessageId) return;
@@ -358,21 +520,27 @@ async function updateStoredDraftMessage(guild, draftId) {
   });
 }
 
-async function startDraftConversation(message, eventKey) {
-  const sessionKey = getSessionKey(message.guild.id, message.author.id);
+//
+// ============================================================
+// 16) DEMARRAGE D'UNE CONVERSATION DE REDACTION
+// ============================================================
+//
+
+async function startDraftConversation(source, eventKey) {
+  const sessionKey = getSessionKey(source.guild.id, source.author.id);
 
   conversationStore.set(sessionKey, {
     eventKey,
-    guildId: message.guild.id,
-    channelId: message.channel.id,
-    userId: message.author.id,
+    guildId: source.guild.id,
+    channelId: source.channel.id,
+    userId: source.author.id,
     step: 0,
     answers: [],
     extraNotes: [],
     createdAt: Date.now(),
   });
 
-  await message.reply(
+  await source.reply(
     `🧠 On prépare un brouillon pour **${EVENT_LABELS[eventKey]}**.\n\n` +
       `Réponds à mes questions directement dans ce salon.\n` +
       `Tape **done** pour générer.\n` +
@@ -381,9 +549,22 @@ async function startDraftConversation(message, eventKey) {
   );
 }
 
+//
+// ============================================================
+// 17) BOT PRET
+// ============================================================
+//
+
 client.once(Events.ClientReady, () => {
+  loadDraftStore();
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
 });
+
+//
+// ============================================================
+// 18) NOUVEAU MEMBRE -> ROLE AUTO + MESSAGE DE BIENVENUE
+// ============================================================
+//
 
 client.on(Events.GuildMemberAdd, async (member) => {
   try {
@@ -415,6 +596,12 @@ client.on(Events.GuildMemberAdd, async (member) => {
   }
 });
 
+//
+// ============================================================
+// 19) GESTION DES MESSAGES TEXTE
+// ============================================================
+//
+
 client.on(Events.MessageCreate, async (message) => {
   try {
     if (message.author.bot) return;
@@ -423,6 +610,10 @@ client.on(Events.MessageCreate, async (message) => {
     const sessionKey = getSessionKey(message.guild.id, message.author.id);
     const session = conversationStore.get(sessionKey);
 
+    //
+    // 19A) Si une conversation de rédaction est déjà en cours,
+    //      on intercepte les réponses de l'utilisateur.
+    //
     if (session && message.channel.id === session.channelId) {
       const content = message.content.trim();
 
@@ -473,6 +664,8 @@ client.on(Events.MessageCreate, async (message) => {
         draft.draftChannelId = draftChannel.id;
 
         draftStore.set(draftId, draft);
+        saveDraftStore();
+
         conversationStore.delete(sessionKey);
 
         await sendLog(
@@ -512,6 +705,9 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    //
+    // 19B) Commande admin : poster le panneau de langue
+    //
     if (message.content === '!setup-lang') {
       if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return message.reply("❌ Tu n'as pas la permission.");
@@ -524,6 +720,9 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    //
+    // 19C) Commande admin : tester le panneau de langue
+    //
     if (message.content === '!test') {
       await message.channel.send({
         content: `🧪 **Test du panneau de langue**\nClique sur un bouton pour tester l’attribution du rôle.`,
@@ -532,59 +731,130 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
+    //
+    // 19D) Nouvelle commande : !draft-event
+    //      -> affiche un menu déroulant de sélection
+    //
     if (message.content === '!draft-event') {
-  if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    return message.reply("❌ Tu n'as pas la permission.");
-  }
+      if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply("❌ Tu n'as pas la permission.");
+      }
 
-  if (conversationStore.has(sessionKey)) {
-    return message.reply(
-      `⚠️ Tu as déjà une session en cours.\n` +
-      `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
-    );
-  }
+      if (conversationStore.has(sessionKey)) {
+        return message.reply(
+          `⚠️ Tu as déjà une session en cours.\n` +
+            `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
+        );
+      }
 
-  await message.reply({
-    content:
-      `🧠 **Création d'un brouillon d'événement**\n` +
-      `Sélectionne l'événement que tu veux rédiger :`,
-    components: buildEventSelectMenu(),
-  });
-  return;
-}
+      await message.reply({
+        content:
+          `🧠 **Création d'un brouillon d'événement**\n` +
+          `Sélectionne l'événement que tu veux rédiger :`,
+        components: buildEventSelectMenu(),
+      });
+      return;
+    }
 
-if (message.content.startsWith('!draft-event ')) {
-  if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    return message.reply("❌ Tu n'as pas la permission.");
-  }
+    //
+    // 19E) Ancien raccourci conservé : !draft-event crazyjoe
+    //
+    if (message.content.startsWith('!draft-event ')) {
+      if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        return message.reply("❌ Tu n'as pas la permission.");
+      }
 
-  const parts = message.content.replace('!draft-event ', '').trim().split(' ');
-  const eventKey = (parts.shift() || '').toLowerCase();
+      const parts = message.content.replace('!draft-event ', '').trim().split(' ');
+      const eventKey = (parts.shift() || '').toLowerCase();
 
-  if (!EVENT_CHANNELS[eventKey]) {
-    return message.reply(
-      `❌ Événement inconnu. Utilise : ${Object.keys(EVENT_CHANNELS).join(', ')}`
-    );
-  }
+      if (!EVENT_CHANNELS[eventKey]) {
+        return message.reply(
+          `❌ Événement inconnu. Utilise : ${Object.keys(EVENT_CHANNELS).join(', ')}`
+        );
+      }
 
-  if (conversationStore.has(sessionKey)) {
-    return message.reply(
-      `⚠️ Tu as déjà une session en cours.\n` +
-      `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
-    );
-  }
+      if (conversationStore.has(sessionKey)) {
+        return message.reply(
+          `⚠️ Tu as déjà une session en cours.\n` +
+            `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
+        );
+      }
 
-  await startDraftConversation(message, eventKey);
-  return;
-}
+      await startDraftConversation(message, eventKey);
+      return;
+    }
   } catch (error) {
     console.error('Erreur messageCreate complète :', error);
     await message.reply('❌ Une erreur est survenue pendant le traitement du message.').catch(() => {});
   }
 });
 
+//
+// ============================================================
+// 20) GESTION DES INTERACTIONS
+//     -> boutons, menus, modals
+// ============================================================
+//
+
 client.on(Events.InteractionCreate, async (interaction) => {
   try {
+    //
+    // 20A) Menu déroulant de sélection d'événement
+    //
+    if (interaction.isStringSelectMenu() && interaction.customId === 'draft_event_select') {
+      if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        await interaction.reply({
+          content: "❌ Tu n'as pas la permission.",
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const sessionKey = getSessionKey(interaction.guild.id, interaction.user.id);
+
+      if (conversationStore.has(sessionKey)) {
+        await interaction.reply({
+          content:
+            `⚠️ Tu as déjà une session en cours.\n` +
+            `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`,
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      const eventKey = interaction.values[0];
+
+      if (!EVENT_CHANNELS[eventKey]) {
+        await interaction.reply({
+          content: '❌ Événement invalide.',
+          flags: MessageFlags.Ephemeral,
+        });
+        return;
+      }
+
+      await interaction.update({
+        content:
+          `✅ Événement sélectionné : **${EVENT_LABELS[eventKey]}**\n` +
+          `Je démarre la rédaction guidée dans ce salon.`,
+        components: [],
+      });
+
+      await startDraftConversation(
+        {
+          guild: interaction.guild,
+          author: interaction.user,
+          channel: interaction.channel,
+          reply: async (payload) => interaction.followUp(payload),
+        },
+        eventKey
+      );
+
+      return;
+    }
+
+    //
+    // 20B) Boutons de langue
+    //
     if (interaction.isButton() && interaction.customId.startsWith('lang_')) {
       const langCode = interaction.customId.split('_')[1];
       const roleIdToAdd = ROLES[langCode];
@@ -592,13 +862,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!roleIdToAdd) {
         await interaction.reply({
           content: '❌ Aucun rôle configuré pour cette langue.',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
       const member = interaction.member;
       const allLanguageRoleIds = Object.values(ROLES).filter(Boolean);
+
       const rolesToRemove = allLanguageRoleIds.filter(
         (roleId) => roleId !== roleIdToAdd && member.roles.cache.has(roleId)
       );
@@ -623,7 +894,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
       await interaction.reply({
         content: `✅ Ton rôle de langue a été défini sur **${labels[langCode] || langCode}**.`,
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
 
       await sendLog(
@@ -633,11 +904,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
       return;
     }
 
+    //
+    // 20C) Boutons de gestion des drafts
+    //
     if (interaction.isButton() && interaction.customId.startsWith('draft_')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         await interaction.reply({
           content: "❌ Tu n'as pas la permission.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -652,130 +926,93 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!draft) {
         await interaction.reply({
           content: '❌ Brouillon introuvable ou expiré.',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
+      //
+      // Validation du brouillon
+      //
       if (action === 'validate' || action === 'validate_everyone') {
-  await interaction.deferUpdate();
+        await interaction.deferUpdate();
 
-  try {
-    await publishDraft(interaction.guild, draft, {
-      mentionEveryone: action === 'validate_everyone',
-    });
+        try {
+          await publishDraft(interaction.guild, draft, {
+            mentionEveryone: action === 'validate_everyone',
+          });
 
-    await interaction.message.edit({
-      content:
-        `✅ **Publié** dans <#${draft.targetChannelId}>` +
-        (action === 'validate_everyone' ? ' avec **@everyone**.' : '.'),
-      components: [],
-      
-      if (interaction.isStringSelectMenu() && interaction.customId === 'draft_event_select') {
-  if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
-    await interaction.reply({
-      content: "❌ Tu n'as pas la permission.",
-      ephemeral: true,
-    });
-    return;
-  }
+          await interaction.message.edit({
+            content:
+              `✅ **Publié** dans <#${draft.targetChannelId}>` +
+              (action === 'validate_everyone' ? ' avec **@everyone**.' : '.'),
+            components: [],
+          });
 
-  const sessionKey = getSessionKey(interaction.guild.id, interaction.user.id);
+          draftStore.delete(draftId);
+          saveDraftStore();
 
-  if (conversationStore.has(sessionKey)) {
-    await interaction.reply({
-      content:
-        `⚠️ Tu as déjà une session en cours.\n` +
-        `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`,
-      ephemeral: true,
-    });
-    return;
-  }
+          await sendLog(
+            interaction.guild,
+            `✅ Guide **${draft.eventLabel}** publié par **${interaction.user.tag}**` +
+              (action === 'validate_everyone' ? ' avec @everyone' : '')
+          );
+        } catch (publishError) {
+          console.error('Erreur publication draft complète :', publishError);
 
-  const eventKey = interaction.values[0];
+          const reason = publishError?.message || 'Erreur inconnue.';
 
-  if (!EVENT_CHANNELS[eventKey]) {
-    await interaction.reply({
-      content: '❌ Événement invalide.',
-      ephemeral: true,
-    });
-    return;
-  }
+          await interaction.message.edit({
+            content:
+              `❌ **Échec de publication** pour **${draft.eventLabel}** dans <#${draft.targetChannelId}>.\n` +
+              `**Cause :** ${reason}\n` +
+              `Le brouillon a été conservé pour nouvel essai.`,
+            components: buildDraftButtons(draftId),
+          }).catch(() => {});
+        }
 
-  await interaction.update({
-    content:
-      `✅ Événement sélectionné : **${EVENT_LABELS[eventKey]}**\n` +
-      `Je démarre la rédaction guidée dans ce salon.`,
-    components: [],
-  });
+        return;
+      }
 
-  await startDraftConversation(
-    {
-      guild: interaction.guild,
-      author: interaction.user,
-      channel: interaction.channel,
-      reply: async (payload) => interaction.followUp(payload),
-    },
-    eventKey
-  );
-
-  return;
-}
-    });
-
-    await sendLog(
-      interaction.guild,
-      `✅ Guide **${draft.eventLabel}** publié par **${interaction.user.tag}**` +
-        (action === 'validate_everyone' ? ' avec @everyone' : '')
-    );
-
-    draftStore.delete(draftId);
-  } catch (publishError) {
-    console.error('Erreur publication draft :', publishError);
-
-    await interaction.message.edit({
-      content:
-        `❌ **Échec de publication** pour **${draft.eventLabel}** dans <#${draft.targetChannelId}>.\n` +
-        `Le brouillon a été conservé pour nouvel essai.`,
-      components: buildDraftButtons(draftId),
-    }).catch(() => {});
-  }
-
-  return;
-}
-
+      //
+      // Régénération du brouillon
+      //
       if (action === 'refuse') {
-  await interaction.deferUpdate();
+        await interaction.deferUpdate();
 
-  try {
-    const regenerated = await generateEventGuide(
-      draft.eventKey,
-      'Propose une nouvelle version, plus claire, plus structurée, plus utile et plus naturelle que la précédente.'
-    );
+        try {
+          const regenerated = await generateEventGuide(
+            draft.eventKey,
+            'Propose une nouvelle version, plus claire, plus structurée, plus utile et plus naturelle que la précédente.'
+          );
 
-    draft.content = regenerated;
-    draftStore.set(draftId, draft);
+          draft.content = regenerated;
+          draftStore.set(draftId, draft);
+          saveDraftStore();
 
-    await updateStoredDraftMessage(interaction.guild, draftId);
+          await updateStoredDraftMessage(interaction.guild, draftId);
 
-    await sendLog(
-      interaction.guild,
-      `🔁 Brouillon **${draft.eventLabel}** régénéré par **${interaction.user.tag}**`
-    );
-  } catch (regenError) {
-    console.error('Erreur régénération draft :', regenError);
+          await sendLog(
+            interaction.guild,
+            `🔁 Brouillon **${draft.eventLabel}** régénéré par **${interaction.user.tag}**`
+          );
+        } catch (regenError) {
+          console.error('Erreur régénération draft :', regenError);
 
-    await interaction.message.edit({
-      content:
-        `❌ **Échec de régénération** pour **${draft.eventLabel}**.\n` +
-        `Le brouillon actuel a été conservé.`,
-      components: buildDraftButtons(draftId),
-    }).catch(() => {});
-  }
+          await interaction.message.edit({
+            content:
+              `❌ **Échec de régénération** pour **${draft.eventLabel}**.\n` +
+              `Le brouillon actuel a été conservé.`,
+            components: buildDraftButtons(draftId),
+          }).catch(() => {});
+        }
 
-  return;
-}
+        return;
+      }
 
+      //
+      // Ouverture du modal d'édition
+      //
       if (action === 'edit') {
         const modal = new ModalBuilder()
           .setCustomId(`draft_modal:${draftId}`)
@@ -789,16 +1026,20 @@ client.on(Events.InteractionCreate, async (interaction) => {
           .setRequired(true);
 
         modal.addComponents(new ActionRowBuilder().addComponents(textInput));
+
         await interaction.showModal(modal);
         return;
       }
     }
 
+    //
+    // 20D) Soumission du modal d'édition
+    //
     if (interaction.isModalSubmit() && interaction.customId.startsWith('draft_modal:')) {
       if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
         await interaction.reply({
           content: "❌ Tu n'as pas la permission.",
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
@@ -809,20 +1050,22 @@ client.on(Events.InteractionCreate, async (interaction) => {
       if (!draft) {
         await interaction.reply({
           content: '❌ Brouillon introuvable ou expiré.',
-          ephemeral: true,
+          flags: MessageFlags.Ephemeral,
         });
         return;
       }
 
       const newContent = interaction.fields.getTextInputValue('draft_content').trim();
+
       draft.content = newContent;
       draftStore.set(draftId, draft);
+      saveDraftStore();
 
       await updateStoredDraftMessage(interaction.guild, draftId);
 
       await interaction.reply({
         content: '✅ Brouillon mis à jour.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
 
       await sendLog(
@@ -837,10 +1080,16 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (!interaction.replied && !interaction.deferred) {
       await interaction.reply({
         content: '❌ Une erreur est survenue.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       }).catch(() => {});
     }
   }
 });
+
+//
+// ============================================================
+// 21) CONNEXION DU BOT
+// ============================================================
+//
 
 client.login(process.env.DISCORD_TOKEN);
