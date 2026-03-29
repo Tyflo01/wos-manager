@@ -67,7 +67,22 @@ client.on(Events.GuildMemberAdd, async (member) => {
     console.error(error);
   }
 });
+client.on('messageCreate', async (message) => {
+  if (message.content === '!test') {
 
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('lang_fr').setLabel('Français').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('lang_en').setLabel('English').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('lang_de').setLabel('Deutsch').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('lang_it').setLabel('Italiano').setStyle(ButtonStyle.Primary),
+    );
+
+    await message.channel.send({
+      content: "🌍 Test choix langue :",
+      components: [row],
+    });
+  }
+});
 client.on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isButton()) return;
 
