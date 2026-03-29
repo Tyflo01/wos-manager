@@ -12,6 +12,7 @@ const {
   TextInputStyle,
   PermissionFlagsBits,
   EmbedBuilder,
+  StringSelectMenuBuilder,
 } = require('discord.js');
 
 const OpenAI = require('openai');
@@ -83,6 +84,7 @@ function buildLanguageButtons() {
     { id: 'lang_it', label: 'Italiano', style: ButtonStyle.Primary },
   ];
 
+
   if (ROLES.ru) {
     buttons.push({ id: 'lang_ru', label: 'Русский', style: ButtonStyle.Primary });
   }
@@ -97,6 +99,23 @@ function buildLanguageButtons() {
   );
 
   return [row];
+}
+
+function buildEventSelectMenu() {
+  const options = Object.entries(EVENT_LABELS).map(([value, label]) => ({
+    label,
+    value,
+    description: `Créer un brouillon pour ${label}`,
+  }));
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId('draft_event_select')
+    .setPlaceholder('Choisis un événement à rédiger')
+    .addOptions(options);
+
+  return [
+    new ActionRowBuilder().addComponents(select),
+  ];
 }
 
 function buildDraftButtons(draftId) {
@@ -513,29 +532,51 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    if (message.content.startsWith('!draft-event ')) {
-      if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-        return message.reply("❌ Tu n'as pas la permission.");
-      }
+    if (message.content === '!draft-event') {
+  if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    return message.reply("❌ Tu n'as pas la permission.");
+  }
 
-      const parts = message.content.replace('!draft-event ', '').trim().split(' ');
-      const eventKey = (parts.shift() || '').toLowerCase();
+  if (conversationStore.has(sessionKey)) {
+    return message.reply(
+      `⚠️ Tu as déjà une session en cours.\n` +
+      `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
+    );
+  }
 
-      if (!EVENT_CHANNELS[eventKey]) {
-        return message.reply(
-          `❌ Événement inconnu. Utilise : ${Object.keys(EVENT_CHANNELS).join(', ')}`
-        );
-      }
+  await message.reply({
+    content:
+      `🧠 **Création d'un brouillon d'événement**\n` +
+      `Sélectionne l'événement que tu veux rédiger :`,
+    components: buildEventSelectMenu(),
+  });
+  return;
+}
 
-      if (conversationStore.has(sessionKey)) {
-        return message.reply(
-          `⚠️ Tu as déjà une session en cours.\nTape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
-        );
-      }
+if (message.content.startsWith('!draft-event ')) {
+  if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    return message.reply("❌ Tu n'as pas la permission.");
+  }
 
-      await startDraftConversation(message, eventKey);
-      return;
-    }
+  const parts = message.content.replace('!draft-event ', '').trim().split(' ');
+  const eventKey = (parts.shift() || '').toLowerCase();
+
+  if (!EVENT_CHANNELS[eventKey]) {
+    return message.reply(
+      `❌ Événement inconnu. Utilise : ${Object.keys(EVENT_CHANNELS).join(', ')}`
+    );
+  }
+
+  if (conversationStore.has(sessionKey)) {
+    return message.reply(
+      `⚠️ Tu as déjà une session en cours.\n` +
+      `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
+    );
+  }
+
+  await startDraftConversation(message, eventKey);
+  return;
+}
   } catch (error) {
     console.error('Erreur messageCreate complète :', error);
     await message.reply('❌ Une erreur est survenue pendant le traitement du message.').catch(() => {});
@@ -629,6 +670,57 @@ client.on(Events.InteractionCreate, async (interaction) => {
         `✅ **Publié** dans <#${draft.targetChannelId}>` +
         (action === 'validate_everyone' ? ' avec **@everyone**.' : '.'),
       components: [],
+      
+      if (interaction.isStringSelectMenu() && interaction.customId === 'draft_event_select') {
+  if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+    await interaction.reply({
+      content: "❌ Tu n'as pas la permission.",
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const sessionKey = getSessionKey(interaction.guild.id, interaction.user.id);
+
+  if (conversationStore.has(sessionKey)) {
+    await interaction.reply({
+      content:
+        `⚠️ Tu as déjà une session en cours.\n` +
+        `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const eventKey = interaction.values[0];
+
+  if (!EVENT_CHANNELS[eventKey]) {
+    await interaction.reply({
+      content: '❌ Événement invalide.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.update({
+    content:
+      `✅ Événement sélectionné : **${EVENT_LABELS[eventKey]}**\n` +
+      `Je démarre la rédaction guidée dans ce salon.`,
+    components: [],
+  });
+
+  await startDraftConversation(
+    {
+      guild: interaction.guild,
+      author: interaction.user,
+      channel: interaction.channel,
+      reply: async (payload) => interaction.followUp(payload),
+    },
+    eventKey
+  );
+
+  return;
+}
     });
 
     await sendLog(
