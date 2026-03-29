@@ -55,7 +55,18 @@ const EVENT_LABELS = {
   foundry: 'Bataille de la Fonderie',
 };
 
+// Stockage en mémoire
 const draftStore = new Map();
+const conversationStore = new Map();
+
+const CONVERSATION_QUESTIONS = [
+  "Quel est l'objectif du message ?",
+  "À qui s'adresse ce guide ? (débutants, tous les membres, officiers, etc.)",
+  "Quel ton veux-tu ? (clair, motivant, strict, pédagogique, etc.)",
+  "Quelles informations doivent absolument apparaître ?",
+  "Y a-t-il des erreurs à éviter ou des consignes importantes à rappeler ?",
+  "Y a-t-il un format particulier souhaité ?",
+];
 
 function buildLanguageButtons() {
   const buttons = [
@@ -108,6 +119,32 @@ function truncateText(text, maxLength) {
   return text.slice(0, maxLength - 3).trimEnd() + '...';
 }
 
+function splitMessage(text, maxLength = 2000) {
+  const chunks = [];
+  let remaining = (text || '').trim();
+
+  while (remaining.length > maxLength) {
+    let splitIndex = remaining.lastIndexOf('\n', maxLength);
+
+    if (splitIndex < 100) {
+      splitIndex = remaining.lastIndexOf(' ', maxLength);
+    }
+
+    if (splitIndex < 100) {
+      splitIndex = maxLength;
+    }
+
+    chunks.push(remaining.slice(0, splitIndex).trim());
+    remaining = remaining.slice(splitIndex).trim();
+  }
+
+  if (remaining.length > 0) {
+    chunks.push(remaining);
+  }
+
+  return chunks;
+}
+
 function buildDraftPreview(draft) {
   const header =
     `🧠 **Brouillon IA - ${draft.eventLabel}**\n` +
@@ -120,6 +157,35 @@ function buildDraftPreview(draft) {
   const previewText = truncateText(draft.content, Math.max(200, maxContentLength));
 
   return header + previewText + footer;
+}
+
+function getSessionKey(guildId, userId) {
+  return `${guildId}:${userId}`;
+}
+
+function buildConversationInstructions(session) {
+  const lines = [];
+
+  for (let i = 0; i < CONVERSATION_QUESTIONS.length; i++) {
+    const question = CONVERSATION_QUESTIONS[i];
+    const answer = session.answers[i] || 'Non précisé';
+    lines.push(`- ${question}\n  Réponse : ${answer}`);
+  }
+
+  if (session.extraNotes && session.extraNotes.length > 0) {
+    lines.push('\nInformations complémentaires :');
+    for (const note of session.extraNotes) {
+      lines.push(`- ${note}`);
+    }
+  }
+
+  return `
+Contexte fourni par l'administrateur :
+${lines.join('\n')}
+
+Rédige un guide Discord adapté à ces attentes.
+Respecte strictement les demandes ci-dessus.
+`;
 }
 
 async function sendLog(guild, text) {
@@ -166,6 +232,7 @@ ${extraInstructions || 'Aucune.'}
   });
 
   const text = response.output_text?.trim();
+
   if (!text) {
     throw new Error('Réponse IA vide.');
   }
@@ -175,6 +242,7 @@ ${extraInstructions || 'Aucune.'}
 
 async function publishDraft(guild, draft) {
   const targetChannel = await guild.channels.fetch(draft.targetChannelId).catch(() => null);
+
   if (!targetChannel || !targetChannel.isTextBased()) {
     throw new Error('Salon cible introuvable ou non textuel.');
   }
@@ -185,30 +253,28 @@ async function publishDraft(guild, draft) {
     await targetChannel.send(part);
   }
 }
-  function splitMessage(text, maxLength = 2000) {
-  const chunks = [];
-  let remaining = text.trim();
 
-  while (remaining.length > maxLength) {
-    let splitIndex = remaining.lastIndexOf('\n', maxLength);
+async function startDraftConversation(message, eventKey) {
+  const sessionKey = getSessionKey(message.guild.id, message.author.id);
 
-    if (splitIndex < 100) {
-      splitIndex = remaining.lastIndexOf(' ', maxLength);
-    }
+  conversationStore.set(sessionKey, {
+    eventKey,
+    guildId: message.guild.id,
+    channelId: message.channel.id,
+    userId: message.author.id,
+    step: 0,
+    answers: [],
+    extraNotes: [],
+    createdAt: Date.now(),
+  });
 
-    if (splitIndex < 100) {
-      splitIndex = maxLength;
-    }
-
-    chunks.push(remaining.slice(0, splitIndex).trim());
-    remaining = remaining.slice(splitIndex).trim();
-  }
-
-  if (remaining.length > 0) {
-    chunks.push(remaining);
-  }
-
-  return chunks;
+  await message.reply(
+    `🧠 On prépare un brouillon pour **${EVENT_LABELS[eventKey]}**.\n\n` +
+      `Réponds à mes questions directement dans ce salon.\n` +
+      `Tu peux taper **done** à tout moment pour générer.\n` +
+      `Tu peux taper **cancel** pour annuler.\n\n` +
+      `**Question 1/${CONVERSATION_QUESTIONS.length}** : ${CONVERSATION_QUESTIONS[0]}`
+  );
 }
 
 client.once(Events.ClientReady, () => {
@@ -250,6 +316,99 @@ client.on(Events.MessageCreate, async (message) => {
     if (message.author.bot) return;
     if (!message.guild) return;
 
+    const sessionKey = getSessionKey(message.guild.id, message.author.id);
+    const session = conversationStore.get(sessionKey);
+
+    // Gestion conversation active
+    if (session && message.channel.id === session.channelId) {
+      const content = message.content.trim();
+
+      if (content.toLowerCase() === 'cancel') {
+        conversationStore.delete(sessionKey);
+        await message.reply('❌ Création du brouillon annulée.');
+        return;
+      }
+
+      if (content.toLowerCase() === 'done') {
+        if (!DRAFT_CHANNEL_ID) {
+          conversationStore.delete(sessionKey);
+          return message.reply("❌ DRAFT_CHANNEL_ID n'est pas configuré.");
+        }
+
+        const draftChannel = await message.guild.channels.fetch(DRAFT_CHANNEL_ID).catch(() => null);
+        if (!draftChannel || !draftChannel.isTextBased()) {
+          conversationStore.delete(sessionKey);
+          return message.reply('❌ Salon de draft introuvable.');
+        }
+
+        await message.reply(
+          `⏳ Je génère maintenant le brouillon pour **${EVENT_LABELS[session.eventKey]}**...`
+        );
+
+        const extraInstructions = buildConversationInstructions(session);
+        const generatedText = await generateEventGuide(session.eventKey, extraInstructions);
+
+        const draftId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+        const draft = {
+          id: draftId,
+          eventKey: session.eventKey,
+          eventLabel: EVENT_LABELS[session.eventKey],
+          targetChannelId: EVENT_CHANNELS[session.eventKey],
+          requestedBy: message.author.id,
+          content: generatedText,
+          draftMessageId: null,
+          draftChannelId: null,
+        };
+
+        const sentDraftMessage = await draftChannel.send({
+          content: buildDraftPreview(draft),
+          components: buildDraftButtons(draftId),
+        });
+
+        draft.draftMessageId = sentDraftMessage.id;
+        draft.draftChannelId = draftChannel.id;
+
+        draftStore.set(draftId, draft);
+        conversationStore.delete(sessionKey);
+
+        await sendLog(
+          message.guild,
+          `🧠 Brouillon **${draft.eventLabel}** généré par **${message.author.tag}**`
+        );
+
+        return;
+      }
+
+      if (session.step < CONVERSATION_QUESTIONS.length) {
+        session.answers[session.step] = content;
+        session.step += 1;
+        conversationStore.set(sessionKey, session);
+
+        if (session.step < CONVERSATION_QUESTIONS.length) {
+          await message.reply(
+            `**Question ${session.step + 1}/${CONVERSATION_QUESTIONS.length}** : ${CONVERSATION_QUESTIONS[session.step]}\n\n` +
+              `Tape **done** si tu veux générer avec les éléments déjà fournis.`
+          );
+        } else {
+          await message.reply(
+            `✅ J'ai récupéré les informations principales.\n` +
+              `Tu peux encore ajouter des précisions dans un nouveau message, ou taper **done** pour générer le brouillon.`
+          );
+        }
+        return;
+      }
+
+      session.extraNotes.push(content);
+      conversationStore.set(sessionKey, session);
+
+      await message.reply(
+        `📝 Information complémentaire ajoutée.\n` +
+          `Tape **done** pour générer le brouillon, ou **cancel** pour annuler.`
+      );
+      return;
+    }
+
     if (message.content === '!setup-lang') {
       if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return message.reply("❌ Tu n'as pas la permission.");
@@ -274,22 +433,14 @@ client.on(Events.MessageCreate, async (message) => {
       return;
     }
 
-    // Commande draft IA
-    // Exemples:
-    // !draft-event beartrap
-    // !draft-event crazyjoe conseils orientés débutants
+    // Démarrer une conversation de draft
     if (message.content.startsWith('!draft-event ')) {
       if (!message.member.permissions.has(PermissionFlagsBits.Administrator)) {
         return message.reply("❌ Tu n'as pas la permission.");
       }
 
-      if (!DRAFT_CHANNEL_ID) {
-        return message.reply("❌ DRAFT_CHANNEL_ID n'est pas configuré.");
-      }
-
       const parts = message.content.replace('!draft-event ', '').trim().split(' ');
       const eventKey = (parts.shift() || '').toLowerCase();
-      const extraInstructions = parts.join(' ').trim();
 
       if (!EVENT_CHANNELS[eventKey]) {
         return message.reply(
@@ -297,36 +448,19 @@ client.on(Events.MessageCreate, async (message) => {
         );
       }
 
-      const draftChannel = await message.guild.channels.fetch(DRAFT_CHANNEL_ID).catch(() => null);
-      if (!draftChannel || !draftChannel.isTextBased()) {
-        return message.reply("❌ Salon de draft introuvable.");
+      if (conversationStore.has(sessionKey)) {
+        return message.reply(
+          `⚠️ Tu as déjà une session de rédaction en cours.\n` +
+            `Tape **done** pour générer ou **cancel** pour annuler avant d'en démarrer une autre.`
+        );
       }
 
-      await message.reply(`⏳ Je génère un brouillon pour **${EVENT_LABELS[eventKey]}**...`);
-
-      const generatedText = await generateEventGuide(eventKey, extraInstructions);
-      const draftId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-      const draft = {
-        id: draftId,
-        eventKey,
-        eventLabel: EVENT_LABELS[eventKey],
-        targetChannelId: EVENT_CHANNELS[eventKey],
-        requestedBy: message.author.id,
-        content: generatedText,
-      };
-
-      draftStore.set(draftId, draft);
-
-      await draftChannel.send({
-        content: buildDraftPreview(draft),
-        components: buildDraftButtons(draftId),
-      });
-
+      await startDraftConversation(message, eventKey);
       return;
     }
   } catch (error) {
     console.error('Erreur messageCreate :', error);
+    await message.reply('❌ Une erreur est survenue pendant le traitement du message.').catch(() => {});
   }
 });
 
@@ -406,7 +540,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
         await publishDraft(interaction.guild, draft);
 
         await interaction.update({
-          content: `✅ **Publié** dans <#${draft.targetChannelId}>\n\n${draft.content}`,
+          content: `✅ **Publié** dans <#${draft.targetChannelId}>\n\n${truncateText(draft.content, 1800)}`,
           components: [],
         });
 
@@ -427,17 +561,25 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         const regenerated = await generateEventGuide(
           draft.eventKey,
-          'Propose une nouvelle version, plus claire et plus structurée que la précédente.'
+          'Propose une nouvelle version, plus claire, plus structurée et plus utile que la précédente.'
         );
 
         draft.content = regenerated;
         draftStore.set(draftId, draft);
 
-        await interaction.message.edit({
+        const updatedMessage = await interaction.message.edit({
           content: buildDraftPreview(draft),
           components: buildDraftButtons(draftId),
         });
 
+        draft.draftMessageId = updatedMessage.id;
+        draft.draftChannelId = updatedMessage.channel.id;
+        draftStore.set(draftId, draft);
+
+        await sendLog(
+          interaction.guild,
+          `🔁 Brouillon **${draft.eventLabel}** régénéré par **${interaction.user.tag}**`
+        );
         return;
       }
 
@@ -484,15 +626,31 @@ client.on(Events.InteractionCreate, async (interaction) => {
       draft.content = newContent;
       draftStore.set(draftId, draft);
 
+      if (draft.draftChannelId && draft.draftMessageId) {
+        const draftChannel = await interaction.guild.channels.fetch(draft.draftChannelId).catch(() => null);
+
+        if (draftChannel && draftChannel.isTextBased()) {
+          const draftMessage = await draftChannel.messages.fetch(draft.draftMessageId).catch(() => null);
+
+          if (draftMessage) {
+            await draftMessage.edit({
+              content: buildDraftPreview(draft),
+              components: buildDraftButtons(draftId),
+            });
+          }
+        }
+      }
+
       await interaction.reply({
         content: '✅ Brouillon mis à jour.',
         ephemeral: true,
       });
 
-      await interaction.message?.edit?.({
-        content: buildDraftPreview(draft),
-        components: buildDraftButtons(draftId),
-      }).catch(() => {});
+      await sendLog(
+        interaction.guild,
+        `✏️ Brouillon **${draft.eventLabel}** édité par **${interaction.user.tag}**`
+      );
+      return;
     }
   } catch (error) {
     console.error('Erreur interaction :', error);
